@@ -1,0 +1,410 @@
+---
+title: "Brett Bertucio 330 Project"
+output: html_document
+date: "2024-06-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# "Who Will Go and Who Will Stay?"
+
+## Purpose
+As I've explored my own career path in data analytics, I've become interested in the growing field of people analytics. This project mines data from an synthetic [HR dataset](https://www.kaggle.com/datasets/rhuebner/human-resources-data-set/data) created by Drs. Carla Patalano and Rich Huebner for use at the New England Institute of Business. 
+
+The dataset contains 36 variables for 300+ employees ranging from their date of birth to salary to reasons for voluntarily leaving the company. I am most interested in the latter. The purpose of this project is to model and predict employee retention. The construction of the model should reveal which factors most lead to retention and which factors lead to voluntary termination. Models can also be used to predict whether particular employees will leave.
+
+## Data Sources, Clearning, and Creating New Derived Variables
+
+Because I'm particularly interested in employees who choose to leave, I've created individual binary variables for different employee statuses (Active, Terminated for Cause, Voluntarily Terminated). 
+
+
+```{r Data, echo=TRUE, message=FALSE, warning=FALSE}
+
+library(tidyverse)
+library(lubridate)
+
+url = "https://drive.google.com/uc?export=download&id=1sjCnxJAICCfW3tU3QzzFRwBLr8CPFL2C"
+hrdata = read.csv(url)
+str(hrdata)
+
+hrdata$Sex = factor(hrdata$Sex)
+hrdata = hrdata %>% mutate_if(is.character, as.factor)
+hrdata$DOB = as.Date(hrdata$DOB) 
+hrdata$DateofHire = as.Date(hrdata$DateofHire) 
+hrdata$DateofTermination = as.integer(hrdata$DateofTermination) 
+hrdata$DateofTermination = as.Date(hrdata$DateofTermination) 
+
+
+#New Derived Variables
+hrdata = hrdata %>%
+  mutate(
+    Active = ifelse(EmploymentStatus == "Active", 1, 0),
+    TerminatedForCause = ifelse(EmploymentStatus == "Terminated for Cause", 1, 0),
+    VoluntarilyTerminated = ifelse(EmploymentStatus == "Voluntarily Terminated", 1, 0)
+  )
+
+
+```
+# Data Exploration and Further Variable Creation
+
+I use a combination of plots and descriptive statistics to understand the contours of my data. To prepare data for use in a decision tree, in a few cases I've created new binary variables that indicate if a row entry is in a variable value of particular interest. Here, I've created variables that express whether an employee lived in the headquarters state ("InState") and whether the employee was in one of the two most common positions to depart - Production Technitian I or II ("ProductionTech")
+
+```{r New Vars, echo=TRUE, message=FALSE, warning=FALSE}
+count(hrdata, TermReason)
+count(hrdata, CitizenDesc)
+count(hrdata, Sex)
+count(hrdata, FromDiversityJobFairID)
+count(hrdata, Position)
+count(hrdata, MaritalDesc)
+count(hrdata %>% filter(VoluntarilyTerminated == 1), Position)
+count(hrdata, State)
+
+hrdata = hrdata %>% mutate(InState = ifelse(State == "MA", 1, 0))
+hrdata$ProductionTech = ifelse(hrdata$PositionID %in% c("19", "20"), 1, 0)
+
+
+```
+
+
+## Plotting Data
+These plots give some context to overall distribution of data and relationships between data. The final plot, a correlation matrix, will be used for feature selection for a logisitc regression model. 
+
+```{r Visualizations, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggplot(hrdata, aes(x = Salary)) +
+  geom_histogram(bins = 20, alpha = 0.5, color = "black", fill = "light blue") +
+  labs(
+    title = "Distribution of Employee Salaries",
+    y = "Number of Employees",
+    x = "Yearly Salary in $USD"
+  )
+
+ggplot(hrdata, aes(x = "", y = Salary))+
+  geom_boxplot()+
+  facet_wrap(~EmploymentStatus)+
+  labs(
+    title = "Employee Salary by Status", 
+    x = "Status",
+    y = "Salary in $USD"
+  )
+
+
+ggplot(hrdata, aes(x = EmploymentStatus, fill = EmploymentStatus)) +
+  geom_bar() +
+  scale_fill_manual(values = c(
+    "Active" = "lightgreen",
+    "Terminated for Cause" = "lightpink",
+    "Voluntarily Terminated" = "lightblue"
+  )) +
+  labs(
+    title = "Employment Status Distribution",
+    y = "Number of Employees",
+    x = "Status",
+    fill = "Status"
+  )
+
+ggplot(hrdata, aes(x = "", y = EmpSatisfaction))+
+  geom_boxplot()+
+  facet_wrap(~EmploymentStatus)+
+  labs(
+    title = "Employee Satisfaction Survey Score by Status", 
+    x = "Status",
+    y = "Satisfaction Score on a Scale of 1 to 5"
+  )
+
+ggplot(hrdata, aes(x = EngagementSurvey, y = EmpSatisfaction, color = EmploymentStatus)) +
+  geom_jitter() +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = c("Active" = "green", "Terminated for Cause" = "red", "Voluntarily Terminated" = "blue")) +
+  labs(
+    title = "Employee Satisfaction vs. Engagement Survey by Employment Status",
+    color = "Employment Status",
+    x = "Engagement Survey",
+    y = "Employee Satisfaction"
+  )
+
+ggplot(hrdata, aes(x = EmploymentStatus, y = PerfScoreID, color = EmpSatisfaction))+
+  geom_jitter(size = 4 )+
+  scale_color_gradient(low = "red", high = "green")+
+  labs(
+    title = "Employee Performance by Status with Satisfaction",
+    x = "Status",
+    y = "Performance Rating (4 = Excellent, 1 = Needs Improvement)",
+    color = "Employee Satisfaction"
+  )
+
+ggplot(hrdata %>% filter(VoluntarilyTerminated == 1), aes(x = ManagerID))+
+  geom_bar()
+
+ggplot(hrdata, aes(x = ManagerID))+
+  geom_bar()
+
+```
+
+The graphs indicate a relationship between employee performance and status, and employee satisfaction and status. There may be a small effect of salary on employement status. It seems that certain managers (ID = 11, 20, 39) managed a lot of employees who left, and there is a more even distribution of employees across managers. The chi-squared test below reveals that manager is a factor that can predict who will depart. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+left_manager = table(hrdata$VoluntarilyTerminated, hrdata$ManagerName)
+
+c2 = chisq.test(left_manager)
+
+print(c2)
+```
+
+The following correlation table will help identify variables that influence employee departure. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+target_variable = hrdata$VoluntarilyTerminated
+other_variables = hrdata %>% select(-VoluntarilyTerminated, -EmpStatusID, -Active, -TerminatedForCause, -LastPerformanceReview_Date, -DOB, -TermReason, -Termd, -Employee_Name, -EmpID, -DateofTermination) %>% select_if(is.numeric)
+
+correlations = sapply(other_variables, function(x) cor(target_variable, x, use = "complete.obs"))
+
+correlation_df = data.frame(Variable = names(correlations), Correlation = correlations)
+print(correlation_df)
+
+
+```
+There are not many variables with high correlations.The highest seem to be the employee's manager, being married, whether they are hired at a diversity job fair, whether they live in the same state as the company headquarters, the number of special products they were assigned, and whether they're a Production Technician. I will experiment with three logistic regressions to predict whether an employee will leave or stay. 
+
+# Models
+
+## Logistic Regression Models
+
+I built three models. The first one using only the factors identified in the correlation table. The second model attempts to purposely overfit, but then the variables that seem to have a statistically significant relationship are used for the thrid modle. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+binomial1 = glm(VoluntarilyTerminated ~ ManagerName + MarriedID + SpecialProjectsCount + InState + FromDiversityJobFairID + ProductionTech, data = hrdata, family = binomial)
+
+summary(binomial1)
+
+binomial2 = glm(VoluntarilyTerminated ~ ManagerName + Absences + GenderID +  
+      InState + MarriedID + FromDiversityJobFairID + EngagementSurvey + EmpSatisfaction +
+        DaysLateLast30 + Absences + RaceDesc + HispanicLatino + 
+      Salary + SpecialProjectsCount + PerfScoreID, data = hrdata, family = binomial)
+
+summary(binomial2)
+
+binomial3 = glm(VoluntarilyTerminated ~ MarriedID + FromDiversityJobFairID +  ProductionTech, data = hrdata, family = binomial)
+
+summary(binomial3)
+
+```
+## Evaluating Logistic Regression Models
+For a logistic regression, AIC measures can capture a balance between accuracy and simplicity. The third model has an AIC of 344, a bit better than the first model's AIC of 349, not not significant. 
+
+Using the models on test and training data and drawing ROC curves can help assess their performance as well.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+library(caret)
+library(pROC)
+
+#Establishing train and test data sets
+set.seed(123)
+ind = sample(2, nrow(hrdata), replace=TRUE, prob=c(0.7, 0.3))
+train = hrdata[ind==1,] 
+test  = hrdata[ind==2,]
+
+test$predicted_prob1 = predict(binomial1, newdata = test, type = "response")
+test$predicted_class1 = ifelse(test$predicted_prob1 > 0.5, 1, 0)
+
+confusion_matrix1 = table(test$VoluntarilyTerminated, test$predicted_class1)
+print(confusion_matrix1)
+
+test$predicted_prob3 = predict(binomial3, newdata = test, type = "response")
+test$predicted_class3 = ifelse(test$predicted_prob1 > 0.5, 1, 0)
+
+confusion_matrix3 = table(test$VoluntarilyTerminated, test$predicted_class3)
+print(confusion_matrix3)
+
+roc3 = roc(test$VoluntarilyTerminated, test$predicted_prob3)
+
+
+roc1 = roc(test$VoluntarilyTerminated, test$predicted_prob1)
+
+
+plot(roc3, col = "blue", main = "ROC Curves for Two Models")
+lines(roc1, col = "red")
+legend("bottomright", legend = c("Model 3", "Model 1"), col = c("blue", "red"), lwd = 2)
+
+```
+The models have identical false positive (10) and false negative (14) results. This indicates that removing managers and special projects from the model has little impact. 
+
+Yet the ROC curves indicate that the first model, with manager and special projects included, has improved sensitivity.
+
+# Unsupervised Learning with Decision Trees and Random Forests
+
+Before attempting to create a decision tree model, I streamlined my data set by removing variables with dates and variables that were collinear with my target variable. Then I split my data into test and training sets, created the tree, and analyzed its performance. 
+
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+library(mlr)
+library(dplyr)
+library(rpart)
+library(rpart.plot)
+
+
+#Getting rid of date columns, idiosyncratic values like names, and Employee Status variables
+hrdata_nodate = hrdata %>% dplyr::select(
+  -DOB, -DateofHire, -DateofTermination, -TermReason, -LastPerformanceReview_Date, -Termd, -Employee_Name, -EmploymentStatus, -Active, -TerminatedForCause, -EmpStatusID)
+
+hrdata_nodate = na.omit(hrdata_nodate)
+hrdata_nodate$VoluntarilyTerminated = as.factor(hrdata_nodate$VoluntarilyTerminated)
+
+# Split data into training and testing sets
+set.seed(123) 
+train_index = sample(1:nrow(hrdata_nodate), 0.7 * nrow(hrdata_nodate))
+train_tree = hrdata_nodate[train_index, ]
+test_tree = hrdata_nodate[-train_index, ]
+
+tree_model = rpart(VoluntarilyTerminated ~ ., data=train_tree, method="class", control=rpart.control(cp=0.01))
+print(tree_model)
+
+rpart.plot(tree_model, type=2, extra=104, fallen.leaves=TRUE, cex=0.5, main="Decision Tree")
+
+tree_predictions = predict(tree_model, test_tree, type="class")
+
+conf_matrix = confusionMatrix(tree_predictions, test_tree$VoluntarilyTerminated)
+print(conf_matrix)
+
+```
+This decision tree had a slightly higher rate of false positives (17) and a slightly lower rate of false negatives (12) than my logistic models. 
+
+To try to improve the model, I used hyperparameter tuning. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+train_control = trainControl(method="cv", number=10)
+tree_cv_model = caret::train(VoluntarilyTerminated ~ ., data = train_tree, method = "rpart",
+                              trControl = train_control)
+print(tree_cv_model)
+tune_grid = expand.grid(cp = seq(0.01, 0.1, by = 0.01))
+tree_tuned_model = caret::train(VoluntarilyTerminated ~ ., data=train_tree, method="rpart", trControl=train_control, tuneGrid=tune_grid)
+
+rpart.plot(tree_tuned_model$finalModel, type=2, extra=104, fallen.leaves=TRUE, main="Tuned Decision Tree")
+
+tree_predictions_tuned = predict(tree_tuned_model, test_tree, type="raw")
+
+conf_matrix_tuned = confusionMatrix(tree_predictions_tuned, test_tree$VoluntarilyTerminated)
+print(conf_matrix_tuned)
+```
+The tuned model only had two decision nodes, both determined by whether an employee had a certain manager. The tuned model dramatically decreased the number of false postitives (2) but increased the number of false negatives (26). 
+
+We can plot the ROC curves of both tree models and compare them to the logistic models. The AUC values and the ROC curves show that the first logistic model and the original tree model outperform the other models and perform quite similarly. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+tree_prob_predictions = predict(tree_model, test_tree, type = "prob")
+prob_positive_class = tree_prob_predictions[, 2]
+roc_tree = roc(test_tree$VoluntarilyTerminated, prob_positive_class, levels = c("0", "1"))
+
+
+tree_predictions_tuned = predict(tree_tuned_model, test_tree, type="prob")
+prob_positive_tuned = tree_predictions_tuned[, 2]
+roc_tree_tuned = roc(test_tree$VoluntarilyTerminated, prob_positive_tuned, levels = c("0", "1"))
+
+
+plot(roc3, col = "blue", main = "ROC Curves for Two Logistic and Two Tree Models")
+lines(roc1, col = "red")
+lines(roc_tree, col = "green")
+lines(roc_tree_tuned, col = "orange")
+legend("bottomright", legend = c("Model 3", "Model 1", "Tree Model", "Tuned Tree Model"), col = c("blue", "red", "green", "orange"), lwd = 2)
+
+
+#AUC vales for all 4 models
+
+AUCs = c(auc(roc1), auc(roc3), auc(roc_tree), auc(roc_tree_tuned))
+auclabs = c("Logistic Model 1", "Logistic Model 3", "Tree Model", "Tuned Tree Model")
+
+AUCvalues = data.frame(auclabs, AUCs)
+print(AUCvalues)
+```
+## Random Forest Model
+
+Lastly, I attempted to construct a random forest model, and added its ROC curve and AUC measures to my comparisons. 
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(randomForest)
+set.seed(71)
+
+rf = randomForest(VoluntarilyTerminated~.,data=train_tree, ntree=100) 
+print(rf)
+
+rf_predict = predict(rf, newdata = test_tree)
+
+confusion_matrix_rf = confusionMatrix(test_tree$VoluntarilyTerminated, rf_predict)
+print(confusion_matrix_rf)
+
+rf_predict_prob = predict(rf, newdata = test_tree, type = "prob")
+
+prob_positive_class_rf = rf_predict_prob[, 2]
+
+
+roc_rf <- roc(test_tree$VoluntarilyTerminated, prob_positive_class_rf, levels = c("0", "1"))
+
+plot(roc3, col = "blue", main = "ROC Curves for Two Logistic and Two Tree Models")
+lines(roc1, col = "red")
+lines(roc_tree, col = "green")
+lines(roc_tree_tuned, col = "orange")
+lines(roc_rf, col = "purple")
+legend("bottomright", legend = c("Model 3", "Model 1", "Tree Model", "Tuned Tree Model", "Random Forest Model"), col = c("blue", "red", "green", "orange", "purple"), lwd = 2)
+
+
+AUCs2 = c(auc(roc1), auc(roc3), auc(roc_tree), auc(roc_tree_tuned), auc(roc_rf))
+auclabs2 = c("Logistic Model 1", "Logistic Model 3", "Tree Model", "Tuned Tree Model", "Random Forest Model")
+
+AUCvalues2 = data.frame(auclabs2, AUCs2)
+print(AUCvalues2)
+
+```
+Here, the random forest model improves just slightly on the first logistic regression model. It may be useful to inform more explainable models, like a new logisitic model.
+
+# Feature Engineering with Random Forest
+
+Finally, I used the random forest model to identify the 5 most important features and then created a logistic regression using them.
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+
+importance(rf)
+varImpPlot(rf)
+
+binomial4 = glm(VoluntarilyTerminated ~ ManagerName + RecruitmentSource + Salary + Zip + Absences, data = hrdata, family = binomial)
+
+summary(binomial4)
+
+test$predicted_prob4 = predict(binomial4, newdata = test, type = "response")
+test$predicted_class4 = ifelse(test$predicted_prob4 > 0.5, 1, 0)
+
+confusion_matrix4 = table(test$VoluntarilyTerminated, test$predicted_class4)
+print(confusion_matrix4)
+
+roc4 = roc(test$VoluntarilyTerminated, test$predicted_prob4)
+
+plot(roc3, col = "blue", main = "ROC Curves for Two Logistic and Two Tree Models")
+lines(roc1, col = "red")
+lines(roc_tree, col = "green")
+lines(roc_tree_tuned, col = "orange")
+lines(roc_rf, col = "purple")
+lines(roc4, col = "black")
+legend("bottomright", legend = c("Model 3", "Model 1", "Tree Model", "Tuned Tree Model", "Random Forest Model", "Feature-Engineered Model"), col = c("blue", "red", "green", "orange", "purple", "black"), lwd = 2)
+
+AUCs3 = c(auc(roc1), auc(roc3), auc(roc_tree), auc(roc_tree_tuned), auc(roc_rf), auc(roc4))
+auclabs3 = c("Logistic Model 1", "Logistic Model 3", "Tree Model", "Tuned Tree Model", "Radom Forest Model", "Feature-Engineered Model")
+
+AUCvalues3 = data.frame(auclabs3, AUCs3)
+print(AUCvalues3)
+
+```
+# Conclusions, Limitations, and Recommendations for Decision-Making
+
+Several iterations of modeling demonstrated how difficult it is to predict with high accuracy whether an employee will choose to remain with the company. While we can build a model with an accuracy approaching 3/4s, the casual linkages between factors and the decision to leave are far from clear. An employee recruited from a certain source might be more likely to leave because that source (i.e. a diversity recruiting fair) might identify them as members of group which is in turn poorly treated as an employee, or might be part of a group (i.e. LinkedIn) which have advanced self-promotion skills. Our models here cannot uncover the causal mechanisms behind human action. 
+
+However, the models can suggest emphases for management. A manager seems to be the largest determinant of employee retention. Identifying and training excellent managers should be a priority for the organization. Salary, of course, plays a key role, as does location (likely proximity to the company's headquarters). Interestingly, abecenses are a key predictor of employee turnover, apart from performance. It may be helpful to identify increases in employee absences, not for discplinary action but to create intervention systems to increase their likelyhood of staying. 
+
